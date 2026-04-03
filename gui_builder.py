@@ -182,6 +182,7 @@ class GUIBuilderApp:
         self.temp_guide_pos   = 0
 
         self.api_key          = ""
+        self.api_provider     = "deepseek"
         self.minimap_canvas   = None
 
         self.undo_manager = UndoManager(self)
@@ -207,6 +208,13 @@ class GUIBuilderApp:
         ttk.Radiobutton(win, text="Anthropic Claude", variable=provider_var, value="anthropic").pack(anchor=tk.W,
                                                                                                      padx=20)
 
+        ttk.Label(
+            win,
+            text="Ключ DeepSeek: https://platform.deepseek.com/",
+            foreground="blue",
+            cursor="hand2",
+        ).pack(anchor=tk.W, padx=20, pady=(4, 0))
+
         ttk.Label(win, text="API ключ:").pack(anchor=tk.W, padx=20, pady=(10, 0))
         key_entry = ttk.Entry(win, width=40, show="*")
         key_entry.pack(padx=20, pady=5)
@@ -223,7 +231,7 @@ class GUIBuilderApp:
     def ai_generate_multi_screen(self, prompt):
         """Генерация многоэкранного интерфейса через DeepSeek API"""
         if not self.api_key:
-            messagebox.showwarning("API", "Сначала настройте API ключ (кнопка 🔑)")
+            messagebox.showwarning("API", "Сначала настройте ключ: верхняя панель → «🔑 API»")
             return
 
         self.update_status("🤖 Генерирую многоэкранный интерфейс...")
@@ -296,6 +304,139 @@ class GUIBuilderApp:
         with urllib.request.urlopen(req, timeout=60) as response:
             result = json.loads(response.read().decode())
             return result["choices"][0]["message"]["content"]
+
+    def _call_ai_api(self, system_prompt, user_prompt):
+        """Единая точка вызова ИИ (DeepSeek или Anthropic)."""
+        if getattr(self, "api_provider", "deepseek") == "anthropic":
+            return self._call_anthropic_api(system_prompt, user_prompt)
+        return self._call_deepseek_api(system_prompt, user_prompt)
+
+    def _build_ai_preview_context(self, preview_screen_name=None):
+        """Текстовое описание проекта для ИИ: экраны, виджеты, логика."""
+        lines = ["=== Контекст конструктора (предпросмотр) ==="]
+        if preview_screen_name:
+            lines.append(f"Активный экран в окне предпросмотра: {preview_screen_name}")
+        else:
+            lines.append("Режим: один холст без разбиения на экраны.")
+        if self.screens:
+            for sn, wlist in self.screens.items():
+                lines.append(f"\n--- Экран «{sn}» ({len(wlist)} виджетов) ---")
+                for wo in wlist:
+                    if not getattr(wo, "visible", True):
+                        continue
+                    t = (wo.config.get("text") or "")[:100]
+                    lines.append(
+                        f"  id={wo.id} | {wo.widget_type} | pos=({wo.x},{wo.y}) | "
+                        f"size=({wo.current_width}x{wo.current_height}) | text={t!r} | events={wo.events}"
+                    )
+        else:
+            lines.append("\n--- Виджеты на холсте ---")
+            for wo in self.widgets:
+                if not wo.visible:
+                    continue
+                t = (wo.config.get("text") or "")[:100]
+                lines.append(
+                    f"  id={wo.id} | {wo.widget_type} | pos=({wo.x},{wo.y}) | "
+                    f"size=({wo.current_width}x{wo.current_height}) | text={t!r} | events={wo.events}"
+                )
+        if self.logic_rules:
+            lines.append("\n--- Правила логики (ключ = id виджета-источника) ---")
+            try:
+                lines.append(json.dumps(self.logic_rules, ensure_ascii=False, indent=2))
+            except Exception:
+                lines.append(str(self.logic_rules))
+        if self.screen_transitions:
+            lines.append("\n--- Переходы между экранами (из AI-генерации) ---")
+            lines.append(json.dumps(self.screen_transitions, ensure_ascii=False, indent=2))
+        return "\n".join(lines)
+
+    def _preview_ai_send(self, win, screen_state, q_widget, a_widget):
+        """Отправка вопроса в ИИ из окна предпросмотра (в фоне)."""
+        q = q_widget.get("1.0", "end-1c").strip()
+        if not q:
+            messagebox.showinfo("ИИ", "Введите вопрос.")
+            return
+        if not self.api_key:
+            messagebox.showwarning("API", "Сначала укажите ключ: верхняя панель → «🔑 API».")
+            return
+
+        a_widget.config(state=tk.NORMAL)
+        a_widget.delete("1.0", tk.END)
+        a_widget.insert(tk.END, "Запрос к ИИ…")
+        a_widget.config(state=tk.DISABLED)
+        win.update_idletasks()
+
+        ctx = self._build_ai_preview_context(screen_state.get("name"))
+        system = """Ты помощник в визуальном конструкторе интерфейсов на Tkinter.
+Пользователь смотрит предпросмотр: могут быть несколько экранов, простые и сложные виджеты (Entry, Text, Combobox, Scale и т.д.).
+Помоги с логикой форм, валидацией, сравнением полей, навигацией между экранами, выбором виджетов, UX.
+Отвечай по-русски. Если даёшь шаги в конструкторе — нумеруй. Код давай только если уместно, кратко."""
+
+        user = f"Вопрос:\n{q}\n\n{ctx}"
+
+        def work():
+            try:
+                result = self._call_ai_api(system, user)
+
+                def done():
+                    a_widget.config(state=tk.NORMAL)
+                    a_widget.delete("1.0", tk.END)
+                    a_widget.insert(tk.END, result)
+                    a_widget.config(state=tk.DISABLED)
+
+                win.after(0, done)
+            except Exception as e:
+
+                def err():
+                    a_widget.config(state=tk.NORMAL)
+                    a_widget.delete("1.0", tk.END)
+                    a_widget.insert(tk.END, f"Ошибка: {e}")
+                    a_widget.config(state=tk.DISABLED)
+
+                win.after(0, err)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def attach_preview_ai_panel(self, win, screen_state, parent=None):
+        """Панель чата с ИИ в окне предпросмотра. parent — контейнер (например нижняя часть PanedWindow)."""
+        root = parent if parent is not None else win
+        ai = ttk.LabelFrame(
+            root,
+            text="🤖 ИИ-помощник (видит экраны, id виджетов и правила логики)",
+            padding=6,
+        )
+        ai.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        q = tk.Text(ai, height=3, font=("Arial", 10), wrap=tk.WORD)
+        q.pack(fill=tk.X, pady=(0, 4))
+        hint = (
+            "Примеры: «Как проверить совпадение паролей?», «Что добавить на экран регистрации?», "
+            "«Как связать кнопку с другим экраном?»"
+        )
+        ttk.Label(ai, text=hint, font=("Arial", 8), foreground="gray").pack(anchor=tk.W)
+
+        ttk.Label(ai, text="Ответ:", font=("Arial", 9, "bold")).pack(anchor=tk.W, pady=(6, 0))
+        a = tk.Text(ai, height=10, font=("Consolas", 9), wrap=tk.WORD, state=tk.DISABLED)
+        a.pack(fill=tk.BOTH, expand=True, pady=4)
+
+        bf = ttk.Frame(ai)
+        bf.pack(fill=tk.X)
+        ttk.Button(
+            bf,
+            text="Спросить ИИ",
+            command=lambda: self._preview_ai_send(win, screen_state, q, a),
+        ).pack(side=tk.LEFT, padx=2)
+
+        def quick_tip():
+            q.delete("1.0", tk.END)
+            q.insert(
+                tk.END,
+                "Дай краткий совет по UX и логике для текущего экрана предпросмотра: "
+                "что улучшить и какие виджеты/правила логики добавить.",
+            )
+
+        ttk.Button(bf, text="Шаблон: совет по экрану", command=quick_tip).pack(side=tk.LEFT, padx=2)
+
     def _call_anthropic_api(self, system_prompt, user_prompt):
         """Вызов Anthropic API (существующий метод)"""
         # Используем ваш существующий код для Anthropic
@@ -1237,86 +1378,156 @@ class GUIBuilderApp:
                                         child.bind(event, lambda e, m=msg: messagebox.showinfo("Информация", m))
 
     def preview_with_screens(self):
-        """Предпросмотр с поддержкой экранов"""
+        """Предпросмотр с экранами: полные виджеты, логика из вкладки «Логика», панель ИИ."""
+        import re
+
+        if not self.screens:
+            messagebox.showinfo(
+                "Предпросмотр",
+                "Нет экранов — добавьте шаблон с экранами или сгенерируйте интерфейс через ИИ.",
+            )
+            return
+
         win = tk.Toplevel(self.root)
-        win.title("👁 Предпросмотр - Регистрация")
-        win.geometry("600x500")
+        win.title("👁 Предпросмотр + ИИ")
+        win.geometry("920x760")
         win.configure(bg="#f0f0f0")
 
-        # Заголовок
-        ttk.Label(win, text="Предпросмотр с поддержкой экранов",
-                  font=("Arial", 12, "bold")).pack(pady=10)
+        screen_state = {"name": None}
 
-        # Основной фрейм для контента
-        content_frame = tk.Frame(win, bg="white", relief=tk.SUNKEN, bd=1)
-        content_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        pw = ttk.PanedWindow(win, orient=tk.VERTICAL)
+        pw.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
-        # Текущий отображаемый экран
-        current_preview_screen = ["login"]
+        upper = ttk.Frame(pw)
+        pw.add(upper, weight=3)
+
+        ttk.Label(
+            upper,
+            text="Предпросмотр экранов (как на холсте) + правила логики",
+            font=("Arial", 12, "bold"),
+        ).pack(anchor=tk.W, padx=8, pady=6)
+
+        nav_frame = tk.Frame(upper, bg="#2c3e50")
+        nav_frame.pack(fill=tk.X, padx=8, pady=2)
+
+        tk.Label(
+            nav_frame,
+            text="📱 Экраны:",
+            bg="#2c3e50",
+            fg="white",
+            font=("Arial", 9, "bold"),
+        ).pack(side=tk.LEFT, padx=10)
+
+        canvas_holder = tk.Frame(upper, bg="white")
+        canvas_holder.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        cv = tk.Canvas(
+            canvas_holder,
+            bg="white",
+            highlightthickness=1,
+            highlightbackground="#ccc",
+        )
+        sc = ttk.Scrollbar(canvas_holder, orient="vertical", command=cv.yview)
+        cv.configure(yscrollcommand=sc.set)
+        sc.pack(side=tk.RIGHT, fill=tk.Y)
+        cv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        def _inner_from_container(container):
+            for ch in container.winfo_children():
+                return ch
+            return None
 
         def render_preview_screen(screen_name):
-            # Очищаем фрейм
-            for child in content_frame.winfo_children():
-                child.destroy()
+            screen_state["name"] = screen_name
+            cv.delete("all")
 
             if screen_name not in self.screens:
                 return
 
-            # Создаем виджеты
+            preview_widgets = {}
+            max_x, max_y = 400, 300
+
             for wo in self.screens[screen_name]:
-                frame = tk.Frame(content_frame, bg=wo.config.get("bg", "#f0f0f0"),
-                                 relief=tk.RAISED, bd=1)
-                frame.place(x=wo.x, y=wo.y, width=wo.current_width, height=wo.current_height)
+                if not getattr(wo, "visible", True):
+                    continue
+                try:
+                    w = self.create_preview_widget(cv, wo.widget_type, wo.config, wo)
+                    cid = cv.create_window(wo.x, wo.y, window=w, anchor="nw")
+                    preview_widgets[str(wo.id)] = {
+                        "widget": w,
+                        "canvas_id": cid,
+                        "x": wo.x,
+                        "y": wo.y,
+                    }
+                    max_x = max(max_x, wo.x + wo.current_width + 40)
+                    max_y = max(max_y, wo.y + wo.current_height + 40)
+                except Exception:
+                    pass
 
-                # Создаем внутренний виджет
-                if wo.widget_type == "Label":
-                    widget = tk.Label(frame, text=wo.config.get("text", ""),
-                                      bg=wo.config.get("bg", "#f0f0f0"),
-                                      fg=wo.config.get("fg", "black"))
-                elif wo.widget_type == "Button":
-                    widget = tk.Button(frame, text=wo.config.get("text", ""),
-                                       bg=wo.config.get("bg", "#e0e0e0"),
-                                       fg=wo.config.get("fg", "black"))
-                elif wo.widget_type == "Entry":
-                    widget = tk.Entry(frame, width=wo.config.get("width", 20),
-                                      bg=wo.config.get("bg", "white"))
-                    if wo.config.get("show"):
-                        widget.config(show=wo.config["show"])
-                else:
-                    widget = tk.Label(frame, text=f"[{wo.widget_type}]")
-
-                widget.pack(fill=tk.BOTH, expand=True)
-
-                # Привязываем события
-                for event, command in wo.events.items():
+            for wo in self.screens[screen_name]:
+                if not getattr(wo, "visible", True):
+                    continue
+                wid = str(wo.id)
+                pdata = preview_widgets.get(wid)
+                if not pdata:
+                    continue
+                inner = _inner_from_container(pdata["widget"])
+                if not inner:
+                    continue
+                for ev, command in wo.events.items():
                     if command.startswith("switch_screen"):
-                        target = command.split("'")[1] if "'" in command else command.split('"')[1]
-                        widget.bind(event, lambda e, t=target: render_preview_screen(t))
+                        m = re.search(r"['\"]([^'\"]+)['\"]", command)
+                        target = m.group(1) if m else ""
+                        inner.bind(ev, lambda e, t=target: render_preview_screen(t))
                     elif command.startswith("show_message"):
-                        msg = command.split("'")[1] if "'" in command else command.split('"')[1]
-                        widget.bind(event, lambda e, m=msg: messagebox.showinfo("Инфо", m))
+                        m = re.search(r"['\"]([^'\"]+)['\"]", command)
+                        msg = m.group(1) if m else ""
+                        inner.bind(ev, lambda e, m=msg: messagebox.showinfo("Инфо", m))
 
-        # Панель навигации в предпросмотре
-        nav_frame = tk.Frame(win, bg="#2c3e50")
-        nav_frame.pack(fill=tk.X, padx=20, pady=10)
+            if self.logic_rules and preview_widgets:
+                self.apply_logic_to_preview(preview_widgets, cv)
 
-        tk.Label(nav_frame, text="📱 Навигация:", bg="#2c3e50", fg="white",
-                 font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=10)
+            cv.configure(scrollregion=(0, 0, max_x, max_y))
 
-        for screen_key, screen_label in [("login", "Вход"), ("forgot_password", "Забыли пароль"),
-                                         ("verify_email", "Подтверждение"), ("register", "Регистрация")]:
-            if screen_key in self.screens:
-                btn = tk.Button(nav_frame, text=screen_label, bg="#34495e", fg="white",
-                                command=lambda k=screen_key: render_preview_screen(k))
-                btn.pack(side=tk.LEFT, padx=2)
-                btn.bind("<Enter>", lambda e, b=btn: b.config(bg="#1abc9c"))
-                btn.bind("<Leave>", lambda e, b=btn: b.config(bg="#34495e"))
+        screen_labels = {
+            "login": "Вход",
+            "register": "Регистрация",
+            "forgot_password": "Забыли пароль",
+            "verify_email": "Подтверждение",
+            "main": "Главный",
+        }
 
-        tk.Button(nav_frame, text="✕ Закрыть", bg="#e74c3c", fg="white",
-                  command=win.destroy).pack(side=tk.RIGHT, padx=10)
+        for screen_key in self.screens.keys():
+            lbl = screen_labels.get(screen_key, screen_key)
+            btn = tk.Button(
+                nav_frame,
+                text=lbl,
+                bg="#34495e",
+                fg="white",
+                command=lambda k=screen_key: render_preview_screen(k),
+            )
+            btn.pack(side=tk.LEFT, padx=2)
+            btn.bind("<Enter>", lambda e, b=btn: b.config(bg="#1abc9c"))
+            btn.bind("<Leave>", lambda e, b=btn: b.config(bg="#34495e"))
 
-        # Отображаем начальный экран
-        render_preview_screen("login")
+        tk.Button(
+            nav_frame,
+            text="✕ Закрыть",
+            bg="#e74c3c",
+            fg="white",
+            command=win.destroy,
+        ).pack(side=tk.RIGHT, padx=10)
+
+        lower = ttk.Frame(pw)
+        pw.add(lower, weight=1)
+        self.attach_preview_ai_panel(win, screen_state, parent=lower)
+
+        first = (
+            self.current_screen
+            if self.current_screen in self.screens
+            else next(iter(self.screens.keys()))
+        )
+        render_preview_screen(first)
     def show_screens_list(self):
         """Показывает список всех экранов"""
         if not self.screens:
@@ -1358,6 +1569,11 @@ class GUIBuilderApp:
             ttk.Button(top, text=txt, command=cmd).pack(side=tk.LEFT, padx=2)
 
         ttk.Separator(top, orient="vertical").pack(side=tk.LEFT, padx=6, fill=tk.Y)
+        ttk.Button(top, text="🔑 API", command=self._set_api_key).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="🤖 ИИ: макет", command=self.open_ai_generate_dialog).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="🤖 ИИ: экраны", command=self.open_ai_multi_screen_dialog).pack(side=tk.LEFT, padx=2)
+
+        ttk.Separator(top, orient="vertical").pack(side=tk.LEFT, padx=6, fill=tk.Y)
         ttk.Button(top, text="↩ Отмена", command=self.undo_manager.undo).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="↪ Повтор", command=self.undo_manager.redo).pack(side=tk.LEFT, padx=2)
 
@@ -1381,35 +1597,96 @@ class GUIBuilderApp:
         main = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         main.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
 
-        # LEFT — palette
-        tool_frame = ttk.LabelFrame(main, text="🧰 Виджеты", padding=5)
+        # LEFT — вся панель (виджеты, шаблоны, быстрые решения, экраны) в одной вертикальной прокрутке
+        tool_frame = ttk.LabelFrame(main, text="🧰 Инструменты", padding=2)
+        self.tool_frame = tool_frame
         main.add(tool_frame, weight=1)
 
+        tb_wrap = tk.Frame(tool_frame)
+        tb_wrap.pack(fill=tk.BOTH, expand=True)
+
+        self.toolbar_scroll = tk.Scrollbar(
+            tb_wrap,
+            orient=tk.VERTICAL,
+            width=14,
+            bg="#d0d0d0",
+            troughcolor="#ececec",
+        )
+        self.toolbar_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.toolbar_canvas = tk.Canvas(
+            tb_wrap,
+            highlightthickness=0,
+            bg="#f0f0f0",
+        )
+        self.toolbar_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.toolbar_canvas.configure(yscrollcommand=self.toolbar_scroll.set)
+        self.toolbar_scroll.config(command=self.toolbar_canvas.yview)
+
+        self.toolbar_inner = ttk.Frame(self.toolbar_canvas)
+        self._toolbar_inner_win = self.toolbar_canvas.create_window(
+            (0, 0),
+            window=self.toolbar_inner,
+            anchor=tk.NW,
+        )
+
+        def _toolbar_inner_cfg(_event=None):
+            bb = self.toolbar_canvas.bbox("all")
+            if bb:
+                self.toolbar_canvas.configure(scrollregion=bb)
+
+        def _toolbar_canvas_cfg(event):
+            try:
+                self.toolbar_canvas.itemconfigure(self._toolbar_inner_win, width=event.width)
+            except tk.TclError:
+                pass
+            _toolbar_inner_cfg()
+
+        self.toolbar_inner.bind("<Configure>", _toolbar_inner_cfg)
+        self.toolbar_canvas.bind("<Configure>", _toolbar_canvas_cfg)
+
+        def _toolbar_wheel(event):
+            if not self._pointer_over_toolbar(event):
+                return
+            if event.delta:
+                self.toolbar_canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        def _toolbar_wheel_linux_up(_e):
+            if self._pointer_over_toolbar(_e):
+                self.toolbar_canvas.yview_scroll(-3, "units")
+
+        def _toolbar_wheel_linux_dn(_e):
+            if self._pointer_over_toolbar(_e):
+                self.toolbar_canvas.yview_scroll(3, "units")
+
+        self.root.bind_all("<MouseWheel>", _toolbar_wheel, add="+")
+        self.root.bind_all("<Button-4>", _toolbar_wheel_linux_up, add="+")
+        self.root.bind_all("<Button-5>", _toolbar_wheel_linux_dn, add="+")
+
         self.search_var = tk.StringVar()
-        se = ttk.Entry(tool_frame, textvariable=self.search_var)
-        se.pack(fill=tk.X, pady=(0, 4))
+        se = ttk.Entry(self.toolbar_inner, textvariable=self.search_var)
+        se.pack(fill=tk.X, pady=(4, 4), padx=4)
         se.bind("<KeyRelease>", lambda e: self._rebuild_palette())
 
-        self.palette_frame = ttk.Frame(tool_frame)
-        self.palette_frame.pack(fill=tk.BOTH, expand=True)
+        self.palette_frame = ttk.Frame(self.toolbar_inner)
+        self.palette_frame.pack(fill=tk.X, padx=4, pady=(0, 4))
+
         self.widget_buttons = {}
         self._rebuild_palette()
 
-        ttk.Separator(tool_frame, orient="horizontal").pack(fill=tk.X, pady=7)
-        ttk.Label(tool_frame, text="📦 Шаблоны форм", font=("Arial", 9, "bold")).pack(anchor=tk.W)
-        self.template_listbox = tk.Listbox(tool_frame, height=4)
-        self.template_listbox.pack(fill=tk.X, pady=2)
+        ttk.Separator(self.toolbar_inner, orient="horizontal").pack(fill=tk.X, pady=7, padx=4)
+        ttk.Label(self.toolbar_inner, text="📦 Шаблоны форм", font=("Arial", 9, "bold")).pack(anchor=tk.W, padx=4)
+        self.template_listbox = tk.Listbox(self.toolbar_inner, height=4)
+        self.template_listbox.pack(fill=tk.X, pady=2, padx=4)
         self.template_listbox.bind("<Double-Button-1>", self.insert_template)
 
-        # Добавляем шаблоны
         for t in ["Форма входа", "Форма регистрации", "Dashboard", "Калькулятор", "Анкета пользователя"]:
             self.template_listbox.insert(tk.END, t)
 
-        ttk.Separator(tool_frame, orient="horizontal").pack(fill=tk.X, pady=7)
+        ttk.Separator(self.toolbar_inner, orient="horizontal").pack(fill=tk.X, pady=7, padx=4)
 
-        # ========== БЫСТРЫЕ РЕШЕНИЯ (без API) ==========
-        quick_frame = ttk.LabelFrame(tool_frame, text="🚀 Быстрые решения", padding=5)
-        quick_frame.pack(fill=tk.X, pady=5)
+        quick_frame = ttk.LabelFrame(self.toolbar_inner, text="🚀 Быстрые решения", padding=5)
+        quick_frame.pack(fill=tk.X, pady=5, padx=4)
 
         ttk.Button(quick_frame, text="📱 Форма регистрации (4 экрана)",
                    command=self.create_registration_flow).pack(fill=tk.X, pady=2)
@@ -1423,14 +1700,18 @@ class GUIBuilderApp:
         ttk.Button(quick_frame, text="📊 Панель управления",
                    command=self.create_dashboard).pack(fill=tk.X, pady=2)
 
-        ttk.Separator(tool_frame, orient="horizontal").pack(fill=tk.X, pady=7)
+        ttk.Separator(self.toolbar_inner, orient="horizontal").pack(fill=tk.X, pady=7, padx=4)
 
-        # ========== Управление экранами ==========
-        screen_frame = ttk.LabelFrame(tool_frame, text="📱 Управление экранами", padding=5)
-        screen_frame.pack(fill=tk.X, pady=5)
+        screen_frame = ttk.LabelFrame(self.toolbar_inner, text="📱 Управление экранами", padding=5)
+        screen_frame.pack(fill=tk.X, pady=(5, 8), padx=4)
         ttk.Button(screen_frame, text="➕ Новый экран", command=self.add_new_screen).pack(fill=tk.X, pady=1)
         ttk.Button(screen_frame, text="🗑 Удалить экран", command=self.delete_current_screen).pack(fill=tk.X, pady=1)
         ttk.Button(screen_frame, text="📋 Список экранов", command=self.show_screens_list).pack(fill=tk.X, pady=1)
+
+        self.toolbar_inner.update_idletasks()
+        _bb = self.toolbar_canvas.bbox("all")
+        if _bb:
+            self.toolbar_canvas.configure(scrollregion=_bb)
 
         # CENTER — canvas with rulers
         canvas_outer = ttk.LabelFrame(main, text="🎨 Рабочая область", padding=2)
@@ -1454,8 +1735,50 @@ class GUIBuilderApp:
 
         canvas_host = tk.Frame(canvas_outer)
         canvas_host.grid(row=1, column=1, sticky="nsew")
+
         self.canvas = tk.Canvas(canvas_host, bg="white", highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+
+        # tk.Scrollbar — заметнее, чем ttk в теме clam
+        self.canvas_vscroll = tk.Scrollbar(
+            canvas_host,
+            orient=tk.VERTICAL,
+            command=self.canvas.yview,
+            width=16,
+            bg="#c8c8c8",
+            troughcolor="#ececec",
+            activebackground="#a0a0a0",
+        )
+        self.canvas_vscroll.grid(row=0, column=1, sticky="ns")
+
+        self.canvas_hscroll = tk.Scrollbar(
+            canvas_host,
+            orient=tk.HORIZONTAL,
+            command=self.canvas.xview,
+            width=16,
+            bg="#c8c8c8",
+            troughcolor="#ececec",
+            activebackground="#a0a0a0",
+        )
+        self.canvas_hscroll.grid(row=1, column=0, sticky="ew")
+
+        canvas_host.grid_columnconfigure(0, weight=1, minsize=50)
+        canvas_host.grid_columnconfigure(1, weight=0, minsize=18)
+        canvas_host.grid_rowconfigure(0, weight=1, minsize=50)
+        canvas_host.grid_rowconfigure(1, weight=0, minsize=18)
+
+        sb_corner = tk.Frame(canvas_host, width=18, height=18, bg="#e8e8e8")
+        sb_corner.grid(row=1, column=1, sticky="nsew")
+
+        def _yscroll(*args):
+            self.canvas_vscroll.set(*args)
+            self.root.after_idle(self._draw_rulers)
+
+        def _xscroll(*args):
+            self.canvas_hscroll.set(*args)
+            self.root.after_idle(self._draw_rulers)
+
+        self.canvas.configure(yscrollcommand=_yscroll, xscrollcommand=_xscroll)
 
         self.mode_label = ttk.Label(canvas_outer, text="Режим: Перемещение", foreground="blue")
         self.mode_label.grid(row=2, column=0, columnspan=2, sticky="w", padx=4, pady=2)
@@ -1700,6 +2023,22 @@ class GUIBuilderApp:
                 "rules": [
                     {"event": "click", "action": "set_text", "target": "", "value": "Нажато!"},
                     {"event": "click", "action": "set_bg", "target": "", "value": "#90ee90"}
+                ]
+            },
+            {
+                "name": "🔐 Регистрация: если два поля совпадают",
+                "desc": "Действие только если значения двух виджетов (например пароль и подтверждение) равны — выберите поле A и B",
+                "rules": [
+                    {"event": "click", "action": "set_text", "target": "", "value": "Пароли совпадают",
+                     "condition": "if_equal", "compare_a": "", "compare_b": ""}
+                ]
+            },
+            {
+                "name": "⚠️ Если поля не совпадают",
+                "desc": "Действие только если значения двух полей различаются (показать ошибку)",
+                "rules": [
+                    {"event": "click", "action": "set_text", "target": "", "value": "Ошибка: не совпадают",
+                     "condition": "if_not_equal", "compare_a": "", "compare_b": ""}
                 ]
             }
         ]
@@ -2170,6 +2509,32 @@ class GUIBuilderApp:
             tip = WIDGET_TOOLTIPS.get(wt,"")
             if tip:
                 Tooltip(btn, tip)
+        self.toolbar_canvas.update_idletasks()
+        bb = self.toolbar_canvas.bbox("all")
+        if bb:
+            self.toolbar_canvas.configure(scrollregion=bb)
+
+    def _pointer_over_toolbar(self, event):
+        """Курсор над левой панелью (включая полосу прокрутки)."""
+        tf = getattr(self, "tool_frame", None)
+        if not tf:
+            return False
+        try:
+            w = self.root.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            return False
+        while w:
+            if w == tf:
+                return True
+            if w == self.root:
+                return False
+            try:
+                par = w.winfo_parent()
+                if not par:
+                    return False
+                w = self.root.nametowidget(par)
+            except Exception:
+                return False
 
     def bind_keys(self):
         r = self.root
@@ -2246,6 +2611,26 @@ class GUIBuilderApp:
             self.canvas.create_line(i, 0, i, 3000, fill="#eeeeee", tags="grid")
             self.canvas.create_line(0, i, 3000, i,  fill="#eeeeee", tags="grid")
         self.canvas.tag_lower("grid")
+        self.update_canvas_scrollregion()
+
+    def update_canvas_scrollregion(self):
+        """Размер виртуального холста: прокрутка вниз/вправо к нижним виджетам и к сетке."""
+        max_x = 900
+        max_y = 700
+        for wo in self.widgets:
+            if not getattr(wo, "visible", True):
+                continue
+            max_x = max(max_x, wo.x + wo.current_width + 120)
+            max_y = max(max_y, wo.y + wo.current_height + 120)
+        if getattr(self, "snap_to_grid", True):
+            max_x = max(max_x, 3000)
+            max_y = max(max_y, 3000)
+        else:
+            max_x = max(max_x, 1600)
+            max_y = max(max_y, 1200)
+        self.canvas.configure(
+            scrollregion=(0, 0, min(max_x, 12000), min(max_y, 12000)),
+        )
 
     def _draw_rulers(self):
         try:
@@ -2544,6 +2929,7 @@ class GUIBuilderApp:
             self.current_mode="move"
             self.mode_label.config(text="Режим: Перемещение")
         self._update_minimap()
+        self.update_canvas_scrollregion()
 
     def on_canvas_double_click(self, event):
         if self.current_widget_type:
@@ -2768,6 +3154,7 @@ class GUIBuilderApp:
                 if wo.selection_rect:
                     self._upd_sel_bounds(wo)
 
+                self.update_canvas_scrollregion()
                 return
             except Exception as e:
                 print(f"Ошибка обновления виджета: {e}")
@@ -2779,6 +3166,7 @@ class GUIBuilderApp:
             wo.frame = None
 
         if not wo.visible:
+            self.update_canvas_scrollregion()
             return
 
         wt = wo.widget_type
@@ -2927,6 +3315,7 @@ class GUIBuilderApp:
                         del obj._drag_start
                         self.undo_manager.save_state("Перемещение")
                         self._update_minimap()
+                        self.update_canvas_scrollregion()
 
                 return on_press, on_drag, on_release
 
@@ -2951,6 +3340,8 @@ class GUIBuilderApp:
             if str(wo.id) in self.selected_widgets:
                 self.select_widgets(self.selected_widgets)
 
+            self.update_canvas_scrollregion()
+
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -2958,6 +3349,7 @@ class GUIBuilderApp:
             tk.Label(ef, text=f"⚠ {wt}", bg="#ffcccc").pack(padx=4, pady=2)
             wo.frame = ef
             wo.widget_instance = self.canvas.create_window(wo.x, wo.y, window=ef, anchor="nw")
+            self.update_canvas_scrollregion()
     # ── SELECTION ─────────────────────────────────────────────────────────────
     def select_widgets(self, ids):
         self.deselect_all()
@@ -3079,6 +3471,35 @@ class GUIBuilderApp:
         value_entry = ttk.Entry(body, textvariable=value_var, width=30)
         value_entry.grid(row=3, column=1, sticky=tk.W, padx=10, pady=5)
 
+        # Условие (если / иначе по смыслу: действие только при выполнении)
+        tk.Label(body, text="УСЛОВИЕ:", bg="white", font=("Arial", 9, "bold")).grid(row=4, column=0, sticky=tk.NW,
+                                                                                    pady=5)
+        cond_frame = tk.Frame(body, bg="white")
+        cond_frame.grid(row=4, column=1, sticky=tk.W, padx=10, pady=5)
+        condition_var = tk.StringVar(value=rule.get("condition", "always") or "always")
+        cond_combo = ttk.Combobox(cond_frame, textvariable=condition_var,
+                                  values=["always", "if_equal", "if_not_equal"],
+                                  width=18, state="readonly")
+        cond_combo.pack(side=tk.LEFT)
+        tk.Label(cond_frame, text="(поле A и B — только для сравнения)", bg="white", fg="gray",
+                 font=("Arial", 8)).pack(side=tk.LEFT, padx=(8, 0))
+
+        tk.Label(body, text="ПОЛЕ A:", bg="white", font=("Arial", 9, "bold")).grid(row=5, column=0, sticky=tk.W, pady=5)
+        compare_a_var = tk.StringVar(value=rule.get("compare_a", "") or "")
+        compare_a_combo = ttk.Combobox(body, textvariable=compare_a_var, width=40)
+        compare_a_combo.grid(row=5, column=1, sticky=tk.W, padx=10, pady=5)
+        self.update_target_list(compare_a_combo)
+
+        tk.Label(body, text="ПОЛЕ B:", bg="white", font=("Arial", 9, "bold")).grid(row=6, column=0, sticky=tk.W, pady=5)
+        compare_b_var = tk.StringVar(value=rule.get("compare_b", "") or "")
+        compare_b_combo = ttk.Combobox(body, textvariable=compare_b_var, width=40)
+        compare_b_combo.grid(row=6, column=1, sticky=tk.W, padx=10, pady=5)
+        self.update_target_list(compare_b_combo)
+
+        cond_hint = tk.Label(body, text=self.get_condition_hint(condition_var.get()),
+                               bg="white", foreground="gray", font=("Arial", 8))
+        cond_hint.grid(row=4, column=2, sticky=tk.W, pady=5)
+
         # Подсказка по действию
         action_hint = tk.Label(body, text=self.get_action_hint(rule.get("action", "set_text")),
                                bg="white", foreground="gray", font=("Arial", 8))
@@ -3090,16 +3511,33 @@ class GUIBuilderApp:
             rule["action"] = action_var.get()
             rule["target"] = target_var.get()
             rule["value"] = value_var.get()
+            rule["condition"] = condition_var.get()
+            rule["compare_a"] = compare_a_var.get()
+            rule["compare_b"] = compare_b_var.get()
             self.logic_status.config(text="Правило сохранено ✓", foreground="green")
             self.root.after(2000, lambda: self.logic_status.config(text=""))
 
-        ttk.Button(body, text="💾 Сохранить", command=save_rule).grid(row=4, column=1, pady=10, sticky=tk.W)
+        ttk.Button(body, text="💾 Сохранить", command=save_rule).grid(row=7, column=1, pady=10, sticky=tk.W)
 
         # Привязка изменения подсказки
         def on_action_change(*args):
             action_hint.config(text=self.get_action_hint(action_var.get()))
 
         action_var.trace_add("write", on_action_change)
+
+        def on_condition_change(*args):
+            cond_hint.config(text=self.get_condition_hint(condition_var.get()))
+
+        condition_var.trace_add("write", on_condition_change)
+
+    def get_condition_hint(self, condition):
+        """Подсказка для режима условия"""
+        hints = {
+            "always": "Действие выполняется всегда (без проверки полей A и B)",
+            "if_equal": "Действие только если текст/значение поля A совпадает с полем B (пароль = подтверждение)",
+            "if_not_equal": "Действие только если поле A и поле B различаются"
+        }
+        return hints.get(condition, hints["always"])
 
     def update_target_list(self, combobox):
         """Обновляет список целевых виджетов"""
@@ -3136,7 +3574,10 @@ class GUIBuilderApp:
             "event": "click",
             "action": "set_text",
             "target": "",
-            "value": ""
+            "value": "",
+            "condition": "always",
+            "compare_a": "",
+            "compare_b": ""
         }
         self.logic_rules[self.current_logic_widget].append(new_rule)
         self.refresh_logic_display()
@@ -3298,21 +3739,45 @@ class GUIBuilderApp:
             messagebox.showinfo("Генерация", "Нет правил для генерации")
             return
 
-        lines = ["# Автоматически сгенерированная логика\n"]
+        lines = [
+            "# Автоматически сгенерированная логика\n",
+            "def _get_widget_val(w):\n",
+            "    if w is None:\n",
+            "        return ''\n",
+            "    cls = w.winfo_class()\n",
+            "    if cls in ('Text', 'TkText'):\n",
+            "        return str(w.get('1.0', 'end-1c')).strip()\n",
+            "    if hasattr(w, 'get') and callable(w.get):\n",
+            "        try:\n",
+            "            return str(w.get())\n",
+            "        except Exception:\n",
+            "            pass\n",
+            "    if hasattr(w, 'cget'):\n",
+            "        try:\n",
+            "            return str(w.cget('text'))\n",
+            "        except Exception:\n",
+            "            pass\n",
+            "    return ''\n",
+            "\n",
+        ]
 
+        rule_idx = 0
         for widget_id, rules in self.logic_rules.items():
             wo = next((w for w in self.widgets if str(w.id) == widget_id), None)
             if not wo:
                 continue
 
             widget_var = f"widget_{widget_id}"
-            lines.append(f"# Логика для {wo.widget_type}")
+            lines.append(f"# Логика для {wo.widget_type} (ID {widget_id})")
 
             for rule in rules:
-                event = rule["event"]
-                action = rule["action"]
-                target = rule["target"]
-                value = rule["value"]
+                event = rule.get("event", "click")
+                action = rule.get("action", "set_text")
+                target = rule.get("target", "")
+                value = rule.get("value", "")
+                cond = (rule.get("condition") or "always").strip()
+                aid = self.find_widget_id_by_name(rule.get("compare_a") or "", {})
+                bid = self.find_widget_id_by_name(rule.get("compare_b") or "", {})
 
                 event_map = {
                     "click": "<Button-1>",
@@ -3323,13 +3788,37 @@ class GUIBuilderApp:
                     "blur": "<FocusOut>"
                 }
 
-                code = f"""
-    def on_{event}_{widget_id}(event):
-        {self.generate_action_code(action, target, value)}
+                action_code = self.generate_action_code(action, target, value)
+                inner_body = "\n".join(
+                    "        " + ln.strip() if ln.strip() else ""
+                    for ln in action_code.split("\n")
+                )
+                if cond in ("if_equal", "if_not_equal") and aid and bid:
+                    op = "==" if cond == "if_equal" else "!="
+                    inner_a = f"inner_{aid}"
+                    inner_b = f"inner_{bid}"
+                    guard = (
+                        f"        # Условие: поля A (ID {aid}) и B (ID {bid}); "
+                        f"подставьте {inner_a}, {inner_b} — внутренние виджеты\n"
+                        f"        if not (_get_widget_val({inner_a}) {op} _get_widget_val({inner_b})):\n"
+                        f"            return\n"
+                    )
+                    inner_body = guard + inner_body
+                    lines.append(
+                        f"# ID {aid} и {bid}: задайте {inner_a}, {inner_b} как первый дочерний виджет "
+                        f"каждого контейнера на холсте\n"
+                    )
 
-    {widget_var}.bind('{event_map.get(event, "<Button-1>")}', on_{event}_{widget_id})
-    """
+                safe_event = str(event).replace("-", "_")
+                fn = f"on_{safe_event}_{widget_id}_{rule_idx}"
+                code = f"""
+    def {fn}(event):
+{inner_body}
+
+    {widget_var}.bind('{event_map.get(event, "<Button-1>")}', {fn})
+"""
                 lines.append(code)
+                rule_idx += 1
 
         code_window = tk.Toplevel(self.root)
         code_window.title("Сгенерированный код логики")
@@ -3500,6 +3989,7 @@ class GUIBuilderApp:
                 self.widgets.remove(wo)
         self.deselect_all(); self.update_layer_panel()
         self.undo_manager.save_state("Удаление"); self._update_minimap()
+        self.update_canvas_scrollregion()
 
     def cut_selection(self):   self.copy_selection(); self.delete_selected()
 
@@ -3611,38 +4101,60 @@ class GUIBuilderApp:
         self._p("Label",20,190,{"text":"Выполнено: 65%","bg":"white","fg":"#555","width":20,"height":1,"font":None})
         self.update_layer_panel(); self._update_minimap()
 
-    # ── AI ────────────────────────────────────────────────────────────────────
-    def _set_api_key(self):
-        """Установка API ключа DeepSeek"""
+    # ── AI (кнопки в верхней панели: 🔑 API, 🤖 ИИ: макет, 🤖 ИИ: экраны) ───────
+    def open_ai_multi_screen_dialog(self):
+        """Запрос описания и вызов генерации нескольких экранов."""
+        p = simpledialog.askstring(
+            "ИИ — многоэкранный интерфейс",
+            "Опишите приложение (например: регистрация, вход, восстановление пароля):",
+            parent=self.root,
+        )
+        if p and str(p).strip():
+            self.ai_generate_multi_screen(str(p).strip())
+
+    def open_ai_generate_dialog(self):
+        """Окно с полем описания — генерация виджетов на текущий холст."""
         win = tk.Toplevel(self.root)
-        win.title("🔑 API ключ DeepSeek")
-        win.geometry("400x200")
+        win.title("🤖 ИИ — макет на холсте")
+        win.geometry("540x340")
         win.transient(self.root)
 
-        ttk.Label(win, text="DeepSeek API ключ", font=("Arial", 10, "bold")).pack(pady=10)
-        ttk.Label(win, text="Получить ключ: https://platform.deepseek.com/", foreground="blue").pack()
+        ttk.Label(
+            win,
+            text="Опишите интерфейс на русском или английском. Пример: «форма входа: email, пароль, кнопка Войти»",
+            wraplength=500,
+        ).pack(padx=12, pady=(12, 6), anchor=tk.W)
 
-        ttk.Label(win, text="API ключ:").pack(anchor=tk.W, padx=20, pady=(10, 0))
-        key_entry = ttk.Entry(win, width=40, show="*")
-        key_entry.pack(padx=20, pady=5)
-        key_entry.insert(0, self.api_key if hasattr(self, 'api_key') else "sk-c30c8fa6351a45f5aad277c6d01ef205")
+        txt = tk.Text(win, width=64, height=11, font=("Arial", 10), wrap=tk.WORD)
+        txt.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
 
-        def save():
-            self.api_key = key_entry.get().strip()
+        bf = ttk.Frame(win)
+        bf.pack(fill=tk.X, pady=(0, 12))
+
+        def go():
+            prompt = txt.get("1.0", "end-1c").strip()
             win.destroy()
-            self.update_status(f"✓ API ключ DeepSeek сохранен")
+            if prompt:
+                self.ai_generate(prompt=prompt)
 
-        ttk.Button(win, text="💾 Сохранить", command=save).pack(pady=15)
+        ttk.Button(bf, text="Отмена", command=win.destroy).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(bf, text="Сгенерировать", command=go).pack(side=tk.RIGHT, padx=6)
 
-    def ai_generate(self):
-        """Простая генерация через DeepSeek API"""
-        prompt = self.ai_entry.get().strip()
+    def ai_generate(self, prompt=None):
+        """Генерация набора виджетов на текущий экран через DeepSeek (один холст)."""
+        if prompt is None:
+            self.open_ai_generate_dialog()
+            return
+        prompt = str(prompt).strip()
         if not prompt:
             return
 
         if not self.api_key:
-            self.api_key = "sk-c30c8fa6351a45f5aad277c6d01ef205"
-            self.update_status("✓ Использую сохраненный API ключ")
+            messagebox.showwarning(
+                "API",
+                "Сначала укажите ключ DeepSeek: верхняя панель → кнопка «🔑 API».",
+            )
+            return
 
         self.update_status("⏳ Генерирую через DeepSeek...")
 
@@ -3656,7 +4168,7 @@ class GUIBuilderApp:
 
         try:
             result = self._call_deepseek_api(system_prompt, f"Create Tkinter GUI for: {prompt}")
-            self._ai_apply(result)
+            self._ai_apply(result, prompt_hint=prompt)
         except Exception as e:
             messagebox.showerror("Ошибка", f"DeepSeek ошибка: {str(e)}")
             self.update_status("❌ Ошибка генерации")
@@ -3682,7 +4194,7 @@ class GUIBuilderApp:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 res=json.loads(resp.read().decode())
                 text=res["content"][0]["text"]
-                self.root.after(0, lambda: self._ai_apply(text))
+                self.root.after(0, lambda t=text, pr=prompt: self._ai_apply(t, prompt_hint=pr))
         except urllib.error.HTTPError as e:
             msg=e.read().decode()
             self.root.after(0, lambda: messagebox.showerror("AI Error",f"{e.code}: {msg[:300]}"))
@@ -3691,7 +4203,7 @@ class GUIBuilderApp:
             self.root.after(0, lambda: messagebox.showerror("AI Error",str(e)))
             self.root.after(0, lambda: self.update_status("AI ошибка"))
 
-    def _ai_apply(self, text):
+    def _ai_apply(self, text, prompt_hint=""):
         try:
             t=text.strip()
             if "```" in t:
@@ -3708,7 +4220,8 @@ class GUIBuilderApp:
                 nw=WidgetItem(wt,item.get("x",50),item.get("y",50),cfg)
                 self.widgets.append(nw); self.render_widget(nw); cnt+=1
             self.update_layer_panel(); self._update_minimap()
-            self.undo_manager.save_state(f"AI: {self.ai_entry.get()[:25]}")
+            hint = (prompt_hint or "")[:25]
+            self.undo_manager.save_state(f"AI: {hint}")
             self.update_status(f"AI создал {cnt} виджетов ✓")
         except Exception as e:
             messagebox.showerror("AI Parse Error",f"{e}\n\n{text[:300]}")
@@ -3720,15 +4233,24 @@ class GUIBuilderApp:
         if self.screens:
             self.preview_with_screens()
         else:
-            # Старый preview для обычных проектов
+            # Предпросмотр с логикой + панель ИИ
             win = tk.Toplevel(self.root)
-            win.title("👁 Предпросмотр")
-            win.geometry("800x600")
+            win.title("👁 Предпросмотр + ИИ")
+            win.geometry("900x720")
             win.configure(bg="white")
 
-            cv = tk.Canvas(win, bg="white", highlightthickness=0)
-            cv.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+            screen_state = {"name": None}
 
+            pw = ttk.PanedWindow(win, orient=tk.VERTICAL)
+            pw.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+            upper = ttk.Frame(pw)
+            pw.add(upper, weight=2)
+
+            cv = tk.Canvas(upper, bg="white", highlightthickness=0)
+            cv.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+            preview_widgets = {}
             for wo in self.widgets:
                 if not wo.visible:
                     continue
@@ -3737,20 +4259,23 @@ class GUIBuilderApp:
                 wt = wo.widget_type
 
                 try:
-                    if wt == "Label":
-                        w = tk.Label(cv, text=cfg.get("text", "Label"), bg=cfg.get("bg", "#f0f0f0"))
-                    elif wt == "Button":
-                        w = tk.Button(cv, text=cfg.get("text", "Button"), bg=cfg.get("bg", "#e0e0e0"))
-                    elif wt == "Entry":
-                        w = tk.Entry(cv, width=cfg.get("width", 12), bg=cfg.get("bg", "white"))
-                        if cfg.get("text"):
-                            w.insert(0, cfg["text"])
-                    else:
-                        w = tk.Label(cv, text=f"[{wt}]", bg="lightyellow")
-
-                    cv.create_window(wo.x, wo.y, window=w, anchor="nw")
-                except Exception as e:
+                    w = self.create_preview_widget(cv, wt, cfg, wo)
+                    cid = cv.create_window(wo.x, wo.y, window=w, anchor="nw")
+                    preview_widgets[str(wo.id)] = {
+                        "widget": w,
+                        "canvas_id": cid,
+                        "x": wo.x,
+                        "y": wo.y,
+                    }
+                except Exception:
                     pass
+
+            if self.logic_rules and preview_widgets:
+                self.apply_logic_to_preview(preview_widgets, cv)
+
+            lower = ttk.Frame(pw)
+            pw.add(lower, weight=1)
+            self.attach_preview_ai_panel(win, screen_state, parent=lower)
 
     def create_preview_widget(self, parent, wt, cfg, original_wo):
         """Создает виджет для предпросмотра"""
@@ -3875,6 +4400,16 @@ class GUIBuilderApp:
         """Применяет все правила логики к виджетам в предпросмотре"""
         log_entries = []  # Для сбора логов
 
+        event_map = {
+            "click": "<Button-1>",
+            "double_click": "<Double-Button-1>",
+            "enter": "<Enter>",
+            "leave": "<Leave>",
+            "focus": "<FocusIn>",
+            "blur": "<FocusOut>",
+            "key_press": "<KeyRelease>",
+        }
+
         for widget_id, rules in self.logic_rules.items():
             if widget_id not in preview_widgets:
                 continue
@@ -3891,15 +4426,18 @@ class GUIBuilderApp:
             if not inner_widget:
                 continue
 
-            for rule in rules:
-                event = rule["event"]
-                action = rule["action"]
-                target_id = self.find_widget_id_by_name(rule["target"], preview_widgets)
-                value = rule["value"]
+            # Несколько правил на одно событие: bind(..., add='+')
+            event_bind_count = {}
 
-                # Привязываем событие
-                self.bind_preview_event(inner_widget, event, action, target_id, value, preview_widgets, log_entries,
-                                        canvas)
+            for rule in rules:
+                ev = rule.get("event", "click")
+                tk_ev = event_map.get(ev, "<Button-1>")
+                n = event_bind_count.get(tk_ev, 0)
+                event_bind_count[tk_ev] = n + 1
+                self.bind_preview_event(
+                    inner_widget, rule, preview_widgets, log_entries, canvas,
+                    bind_add=(n > 0),
+                )
 
         # Если есть логи, показываем в консоли
         if log_entries:
@@ -3916,20 +4454,84 @@ class GUIBuilderApp:
             return match.group(1)
         return None
 
-    def bind_preview_event(self, widget, event, action, target_id, value, preview_widgets, log_entries, canvas):
+    def _preview_inner_widget(self, preview_widgets, widget_id):
+        """Первый дочерний виджет в контейнере предпросмотра."""
+        if not widget_id or widget_id not in preview_widgets:
+            return None
+        tw = preview_widgets[widget_id]["widget"]
+        for child in tw.winfo_children():
+            return child
+        return None
+
+    def _widget_value_for_compare(self, inner):
+        """Текст/значение виджета для сравнения (Entry, Label, Text, …)."""
+        if inner is None:
+            return ""
+        cls = inner.winfo_class()
+        if cls in ("Text", "TkText"):
+            try:
+                return str(inner.get("1.0", "end-1c")).strip()
+            except Exception:
+                return ""
+        if hasattr(inner, "get") and callable(inner.get):
+            try:
+                return str(inner.get())
+            except (tk.TclError, Exception):
+                pass
+        if hasattr(inner, "cget"):
+            try:
+                return str(inner.cget("text"))
+            except Exception:
+                pass
+        return ""
+
+    def _evaluate_rule_condition(self, rule, preview_widgets):
+        """Проверка условия правила (в т.ч. поле A == поле B)."""
+        cond = (rule.get("condition") or "always").strip()
+        if cond in ("", "always", "none"):
+            return True
+        a_name = rule.get("compare_a") or ""
+        b_name = rule.get("compare_b") or ""
+        aid = self.find_widget_id_by_name(a_name, preview_widgets)
+        bid = self.find_widget_id_by_name(b_name, preview_widgets)
+        if not aid or not bid:
+            return False
+        inner_a = self._preview_inner_widget(preview_widgets, aid)
+        inner_b = self._preview_inner_widget(preview_widgets, bid)
+        va = self._widget_value_for_compare(inner_a)
+        vb = self._widget_value_for_compare(inner_b)
+        if cond == "if_equal":
+            return va == vb
+        if cond == "if_not_equal":
+            return va != vb
+        return True
+
+    def bind_preview_event(self, widget, rule, preview_widgets, log_entries, canvas, bind_add=False):
         """Привязывает событие к виджету в предпросмотре"""
+        event = rule.get("event", "click")
+        action = rule.get("action", "set_text")
+        target_id = self.find_widget_id_by_name(rule.get("target", ""), preview_widgets)
+        value = rule.get("value", "")
+
         event_map = {
             "click": "<Button-1>",
             "double_click": "<Double-Button-1>",
             "enter": "<Enter>",
             "leave": "<Leave>",
             "focus": "<FocusIn>",
-            "blur": "<FocusOut>"
+            "blur": "<FocusOut>",
+            "key_press": "<KeyRelease>",
         }
 
         tk_event = event_map.get(event, "<Button-1>")
 
         def handler(e):
+            if not self._evaluate_rule_condition(rule, preview_widgets):
+                log_msg = f"⚡ {event} → условие не выполнено (A/B), действие пропущено"
+                log_entries.append(log_msg)
+                print(log_msg)
+                return
+
             # Находим целевой виджет
             target_widget_data = None
             target_inner = None
@@ -4004,7 +4606,10 @@ class GUIBuilderApp:
                 log_entries.append(error_msg)
                 print(error_msg)
 
-        widget.bind(tk_event, handler)
+        if bind_add:
+            widget.bind(tk_event, handler, add="+")
+        else:
+            widget.bind(tk_event, handler)
 
     def make_preview_draggable(self, preview_widgets, canvas):
         """Делает виджеты в предпросмотре перетаскиваемыми (опционально)"""
